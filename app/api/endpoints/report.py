@@ -17,6 +17,33 @@ from app.models import NotificationType, NotificationType, User
 NotificationTypeOrEmpty = Union[NotificationType, Literal[""]]
 router = APIRouter()
 
+def build_content_disposition(filename: str) -> str:
+    """
+    RFC 6266-compliant Content-Disposition builder.
+
+    Bug this fixes: an unquoted filename= value may only contain "token"
+    characters (no spaces, no commas, etc). Company names like
+    "HONDA MOTOR CO.,LTD." (common in Moody's Orbis / international
+    naming conventions) have both — sent unquoted, Chrome's strict
+    header parser misreads the comma as separating two Content-Disposition
+    values and rejects the whole response with
+    net::ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_DISPOSITION, even though
+    the server only ever sent one header line. Indian/domestic company
+    names rarely contain commas, which is why this was Orbis-specific
+    despite byte-identical code in both backends.
+
+    Quoting the filename (and escaping any internal quote/backslash
+    chars per the quoted-string grammar) fixes the immediate bug. The
+    filename*=UTF-8''... fallback additionally makes non-ASCII names
+    display correctly rather than being silently mangled by older
+    clients that only understand the plain filename= form.
+    """
+    safe_ascii = filename.replace("\\", "\\\\").replace('"', '\\"')
+    from urllib.parse import quote as _urlquote
+    encoded = _urlquote(filename)
+    return f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{encoded}'
+
+
 @router.get("/download-report/")
 async def download_report(
     session_id: str = Query(..., description="Session ID"),
@@ -41,7 +68,7 @@ async def download_report(
         return Response(
             content=file_data,
             media_type=media_type,
-            headers={"Content-Disposition": f"attachment; filename={result}"}
+            headers={"Content-Disposition": build_content_disposition(result)}
         )
 
     except Exception as e:
@@ -60,7 +87,7 @@ async def bulk_download_report(session_id: str = Query(..., description="Session
         return Response(
             content=file_data,
             media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename={result}"}
+            headers={"Content-Disposition": build_content_disposition(result)}
         )
 
     except Exception as e:
@@ -101,9 +128,8 @@ async def screener_bulk_download_report(
         return Response(
             content=zip_data,
             media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
+            headers={"Content-Disposition": build_content_disposition(filename)}
         )
 
     except Exception as e:
         return {"error": str(e)}
-    
