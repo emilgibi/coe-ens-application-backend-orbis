@@ -3,6 +3,9 @@ import pycountry
 from app.core.utils.db_utils import *
 from collections import defaultdict
 from app.core.config import get_settings
+import json
+from openai import AzureOpenAI
+from app.schemas.logger import logger
 
 URI = get_settings().graphdb.uri
 USER = get_settings().graphdb.user
@@ -495,11 +498,18 @@ async def compile_company_findings(ens_id: str, session):
     profile = await pull_profile(ens_id,  latest_session_id, session)
     ratings = await pull_ratings(ens_id,  latest_session_id, session)
     findings = await pull_kpis(ens_id,  latest_session_id, session)
+    # Missing before: ens-backend-probe42's equivalent function includes
+    # this (pull_google_image_name, reading external_supplier_data), which
+    # the frontend's Entity Existence section relies on to fetch location
+    # photos via /report/get-images. Confirmed real data: 41 entities have
+    # google_image_name populated in this DB.
+    google_image_name = await pull_google_image_name(ens_id, latest_session_id, session)
 
     compiled_findings = {
         "profile": profile,
         "ratings": ratings,
         "findings": findings,
+        "google_image_name": google_image_name,
         "metadata": {
             "ens_id": ens_id,
             "latest_session_id": latest_session_id,
@@ -508,6 +518,219 @@ async def compile_company_findings(ens_id: str, session):
     }
 
     return compiled_findings
+
+
+# ─── AI Risk Intelligence Brief (international / Orbis) ──────────────────────
+# Same OPENAI__* config and gpt-5.1 deployment as
+# ens-orchestration-probe42's _call_openai(). Orbis's schema is already
+# theme-based and much flatter than Probe42's (compile_company_findings
+# returns {profile, ratings, findings}, not a multi-megabyte nested record),
+# so the size risk that hit the domestic brief (898,656 tokens against a
+# 272,000 limit) is unlikely here — but the same condense-first discipline
+# is applied from the start rather than waiting for it to become a problem.
+
+_ORBIS_BRIEF_SYSTEM = """You are a senior international risk analyst. Produce a structured brief in EXACTLY this format:
+
+RISK TIER: [LOW / MODERATE / HIGH / CRITICAL]
+
+EXECUTIVE SUMMARY
+[2-3 sentence assessment]
+
+STRENGTHS
+• [3-4 strengths with specific data points]
+
+KEY RISK FLAGS
+• [3-5 specific risks with data points — sanctions, PEP/government ties, adverse media, financial red flags, entity-existence concerns]
+
+FINANCIAL HEALTH
+[2 sentences with specific numbers if financial data is present, otherwise state that financial data is unavailable]
+
+RED LINE ITEMS
+• [Hard blockers or NONE IDENTIFIED]
+
+RECOMMENDATION
+[2 sentences: proceed or not, with conditions]
+
+Rules: Be specific. Cite exact numbers and theme ratings. No hallucination. Use only provided data."""
+
+
+def _truncate_value_orbis(value, max_list_items=15, max_str_len=2000, _depth=0, _max_depth=6):
+    """Same generic safety-net truncation as ens-orchestration-probe42's
+    _truncate_value — duplicated rather than imported since these are two
+    separate services/repos."""
+    if _depth > _max_depth:
+        return "...(truncated: max nesting depth)"
+    if isinstance(value, dict):
+        return {k: _truncate_value_orbis(v, max_list_items, max_str_len, _depth + 1) for k, v in value.items()}
+    if isinstance(value, list):
+        truncated = [_truncate_value_orbis(v, max_list_items, max_str_len, _depth + 1) for v in value[:max_list_items]]
+        if len(value) > max_list_items:
+            truncated.append(f"...(+{len(value) - max_list_items} more, omitted)")
+        return truncated
+    if isinstance(value, str) and len(value) > max_str_len:
+        return value[:max_str_len] + f"...(truncated from {len(value)} chars)"
+    return value
+
+
+def _condense_orbis_financials(financials_map: dict) -> dict:
+    """Latest value per populated metric, grouped by category — mirrors
+    what Section 02's combined chart displays on screen, not the full
+    multi-year history (the full history isn't needed for a brief; latest
+    value + one prior point is enough to describe direction of travel)."""
+    by_category: dict = {}
+    for metric_key, metric in (financials_map or {}).items():
+        data = metric.get("data") if isinstance(metric, dict) else None
+        if not isinstance(data, list) or not data:
+            continue
+        sorted_points = sorted(data, key=lambda p: p.get("closing_date") or "")
+        latest = sorted_points[-1]
+        previous = sorted_points[-2] if len(sorted_points) > 1 else None
+        category = metric.get("category") or "OTHER"
+        by_category.setdefault(category, []).append({
+            "metric": metric.get("title") or metric_key,
+            "latest": latest.get("display_value"),
+            "latest_date": latest.get("closing_date"),
+            "previous": previous.get("display_value") if previous else None,
+        })
+    return by_category
+
+
+def _condense_orbis_data(compiled: dict, financials_map: dict | None = None) -> dict:
+    """Reduce compile_company_findings()'s output (plus, separately,
+    compile_company_financials()'s output — a different DB query the
+    brief didn't originally fetch at all, so financials was represented
+    by only whatever thin "financials" theme KPI findings existed, not
+    the actual metric time series Section 02 shows on screen) to what a
+    risk brief needs: profile fields, all theme ratings, each flagged
+    KPI's definition/rating/details (capped, max 10 items per theme), and
+    now the latest financial figures per category too."""
+    profile = compiled.get("profile") or {}
+    ratings = compiled.get("ratings") or {}
+    findings = compiled.get("findings") or {}
+
+    condensed_findings = {}
+    for theme, items in findings.items():
+        if not isinstance(items, list):
+            continue
+        condensed_items = []
+        for item in items[:10]:
+            if not isinstance(item, dict):
+                continue
+            condensed_items.append({
+                "kpi_area": item.get("kpi_area"),
+                "kpi_code": item.get("kpi_code"),
+                "kpi_definition": item.get("kpi_definition"),
+                "kpi_rating": item.get("kpi_rating"),
+                "kpi_details": item.get("kpi_details"),
+            })
+        condensed_findings[theme] = condensed_items
+
+    condensed = {
+        "profile": profile,
+        "ratings": ratings,
+        "findings": condensed_findings,
+    }
+    if financials_map:
+        condensed["financial_performance"] = _condense_orbis_financials(financials_map)
+    return _truncate_value_orbis(condensed)
+
+
+def _call_orbis_openai(compiled_findings: dict, financials_map: dict | None = None) -> str:
+    settings = get_settings().openai
+    if not settings.azure_endpoint or not settings.api_key:
+        raise RuntimeError("OPENAI__AZURE_ENDPOINT / OPENAI__API_KEY not set in .env")
+
+    condensed = _condense_orbis_data(compiled_findings, financials_map)
+    data_text = f"Entity intelligence data:\n\n{json.dumps(condensed, ensure_ascii=False, indent=2, default=str)}"
+    logger.info(f"Orbis AI brief payload size: {len(data_text)} chars")
+
+    client = AzureOpenAI(
+        azure_endpoint=settings.azure_endpoint,
+        api_key=settings.api_key,
+        api_version="2024-07-01-preview",
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=settings.model_deployment_name,
+            messages=[
+                {"role": "system", "content": _ORBIS_BRIEF_SYSTEM},
+                {"role": "user", "content": data_text},
+            ],
+            max_completion_tokens=4000,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        raise RuntimeError(f"Azure OpenAI call failed: {e}")
+
+
+async def generate_orbis_ai_brief(ens_id: str, session) -> dict:
+    """Controller for POST /graph/get-submodal-ai-brief (international
+    counterpart of ens-orchestration-probe42's generate_vendor_ai_brief).
+
+    Fetches both compile_company_findings() (profile/ratings/KPI findings)
+    AND compile_company_financials() (the metric time series Section 02's
+    chart displays) — these are two separate DB-backed queries in Orbis's
+    schema, unlike Probe42's single record, so both need fetching
+    explicitly or the brief never sees any real financial figures."""
+    compiled = await compile_company_findings(ens_id, session)
+
+    if not compiled.get("profile"):
+        return {
+            "module": "orbis_ai_brief",
+            "status": "failed",
+            "success": False,
+            "upstream_status_code": 404,
+            "message": f"No Orbis data found for ens_id '{ens_id}'.",
+            "data": {},
+        }
+
+    try:
+        financials_result = await compile_company_financials(ens_id, session)
+        financials_map = financials_result.get("financials") or {}
+    except Exception as e:
+        logger.warning(f"Orbis AI brief: financials fetch failed for {ens_id} (continuing without it): {e}")
+        financials_map = {}
+
+    try:
+        brief_text = _call_orbis_openai(compiled, financials_map)
+    except RuntimeError as e:
+        logger.error(f"Orbis AI brief OpenAI call failed for {ens_id}: {e}")
+        return {
+            "module": "orbis_ai_brief",
+            "status": "failed",
+            "success": False,
+            "upstream_status_code": 502,
+            "message": str(e),
+            "data": {},
+        }
+
+    return {
+        "module": "orbis_ai_brief",
+        "status": "completed",
+        "success": True,
+        "upstream_status_code": 200,
+        "message": f"AI brief generated successfully for {compiled['profile'].get('name') or ens_id}",
+        "data": {
+            "brief": brief_text,
+            "brief_type": "generic",
+            "ens_id": ens_id,
+            "name": compiled["profile"].get("name"),
+        },
+    }
+
+
+async def pull_google_image_name(ens_id: str, session_id: str, session):
+    result = await get_dynamic_ens_data_for_session(
+        "external_supplier_data",
+        ["google_image_name"],
+        ens_id,
+        session_id,
+        session
+    )
+    if result:
+        return result[0].get("google_image_name", None)
+    return None
 
 
 async def compile_company_financials(ens_id: str, session):
@@ -647,6 +870,14 @@ async def pull_ratings(ens_id: str, latest_session_id: str, session):
 async def pull_kpis(ens_id: str, session_id: str, session):
 
         theme_mappings = {
+            # Missing before: entity_existence table wasn't in kpi_table_name
+            # at all, so its ADD/DOM findings (address & domain validation —
+            # same concept as Probe42's entity_existance table, mapped to
+            # B2B/DOM in ens-backend-probe42/app/core/supplier/universe.py's
+            # pull_kpis) were silently unreachable via this endpoint even
+            # though the data existed. Confirmed against real data: 22 ADD +
+            # 31 DOM flagged rows across entities before this fix.
+            "entity_existence": ["ADD", "DOM"],
             "sanctions": ["SAN"],
             "government_political": ["PEP", "SCO"],
             "bribery_corruption_overall": ["BCF"],
@@ -658,7 +889,7 @@ async def pull_kpis(ens_id: str, session_id: str, session):
         reverse_area_mapping = {code: theme for theme, codes in theme_mappings.items() for code in codes}
 
         required_columns = ["kpi_area", "kpi_code", "kpi_definition", "kpi_rating", "kpi_flag", "kpi_details"]
-        kpi_table_name = ['cyes', 'fstb', 'lgrk', 'oval', 'rfct', 'sape', 'sown', 'news']
+        kpi_table_name = ['entity_existence', 'cyes', 'fstb', 'lgrk', 'oval', 'rfct', 'sape', 'sown', 'news']
 
         gather_all_kpis = []
         for table_name in kpi_table_name:

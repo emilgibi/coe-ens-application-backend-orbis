@@ -76,6 +76,11 @@ class Allow(BaseModel):
     periodicity: bool
     periodicbatch: int
 
+class Openai(BaseModel):
+    azure_endpoint: str
+    api_key: str
+    model_deployment_name: str = "gpt-5.1"
+
 class Settings(BaseSettings):
     security: Security
     storage: Storage
@@ -84,6 +89,7 @@ class Settings(BaseSettings):
     urls: Urls
     graphdb: GraphDb
     allow: Allow
+    openai: Openai
 
 
     @computed_field  # type: ignore[prop-decorator]

@@ -492,4 +492,95 @@ async def r2_screener_report_bulk_download_by_source(
     except ClientError as e:
         logger.error(f"Error in report_bulk_download_by_source (R2): {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to download reports")
-    
+
+
+async def get_google_images_from_blob(google_image_name: str) -> List[Dict]:
+    """
+    International counterpart of ens-backend-probe42's function of the same
+    name — ported directly (same storage.* settings shape already exists in
+    this repo's config.py, confirmed: storage_account_url,
+    images_container_name, images_sas_token). Fetch all images from the
+    'images' Azure Blob container whose blob names start with the given
+    google_image_name prefix.
+
+    Returns a list of dicts each with:
+      - filename:     base filename of the blob
+      - content_type: inferred MIME type (e.g. "image/png")
+      - data:         base64-encoded image bytes
+
+    Frontend usage:
+      <img src={`data:${item.content_type};base64,${item.data}`} />
+    """
+    import base64
+    import os as _os
+
+    try:
+        storage_url = get_settings().storage.storage_account_url
+        images_container_name = get_settings().storage.images_container_name
+        images_sas_token = str(get_settings().storage.images_sas_token)
+
+        blob_service_client = BlobServiceClient(
+            account_url=storage_url,
+            credential=images_sas_token
+        )
+        container_client = blob_service_client.get_container_client(images_container_name)
+
+        logger.info(f"[IMAGE DEBUG] container_name = {images_container_name}")
+        logger.info(f"[IMAGE DEBUG] google_image_name prefix = {google_image_name}")
+
+        blob_list = list(container_client.list_blobs(name_starts_with=google_image_name))
+
+        logger.info(f"[IMAGE DEBUG] blob count = {len(blob_list)}")
+
+        if not blob_list:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No images found with prefix '{google_image_name}'"
+            )
+
+        content_type_map = {
+            "jpg":  "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png":  "image/png",
+            "gif":  "image/gif",
+            "webp": "image/webp",
+            "svg":  "image/svg+xml",
+            "bmp":  "image/bmp",
+        }
+
+        images = []
+        for blob in blob_list:
+            blob_name = blob.name
+
+            if blob_name.endswith("/"):
+                logger.info(f"[IMAGE DEBUG] skipping folder blob = {blob_name}")
+                continue
+
+            logger.info(f"[IMAGE DEBUG] downloading blob = {blob_name}")
+
+            blob_client = blob_service_client.get_blob_client(
+                container=images_container_name,
+                blob=blob_name
+            )
+            file_data = blob_client.download_blob().readall()
+
+            ext = _os.path.splitext(blob_name)[1].lower().lstrip(".")
+            content_type = content_type_map.get(ext, "image/jpeg")
+
+            encoded = base64.b64encode(file_data).decode("utf-8")
+
+            images.append({
+                "filename":     _os.path.basename(blob_name),
+                "content_type": content_type,
+                "data":         encoded,
+            })
+
+            logger.info(f"[IMAGE DEBUG] processed image = {blob_name}, size = {len(file_data)} bytes")
+
+        return images
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[IMAGE DEBUG] get_google_images_from_blob failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch images: {str(e)}")
+
