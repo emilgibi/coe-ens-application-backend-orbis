@@ -133,3 +133,17 @@ async def screener_bulk_download_report(
 
     except Exception as e:
         return {"error": str(e)}
+
+
+@router.get("/get-images/")
+async def get_images(
+    google_image_name: str = Query(..., description="Image name prefix (e.g. 'ens_id' or 'ens_id/logo')"),
+    current_user: User = Depends(deps.get_current_user)
+):
+    try:
+        images = await get_google_images_from_blob(google_image_name)
+        return {"images": images}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"error": str(e)}

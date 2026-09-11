@@ -103,6 +103,33 @@ async def get_findings(request: SubModalItem,
             detail=f"Failed to retrieve findings for ens_id: {str(error)}"
         )
 
+@router.post("/get-submodal-ai-brief")
+async def get_ai_brief(request: SubModalItem,
+                       session: AsyncSession = Depends(deps.get_session),
+                       current_user: User = Depends(deps.get_current_user)):
+    try:
+        request = request.dict()
+        ens_id = request.get("ens_id", "")
+
+        result = await generate_orbis_ai_brief(ens_id, session)
+
+        if result.get("status") != "completed":
+            status_code = int(result.get("upstream_status_code") or 502)
+            if status_code < 400:
+                status_code = 502
+            raise HTTPException(status_code=status_code, detail=result.get("message"))
+
+        return result["data"]
+
+    except HTTPException as http_err:
+        raise http_err
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate AI brief for ens_id: {str(error)}"
+        )
+
 @router.get("/supplier-countries")
 async def get_supplier_countries(client_id: str = Query(..., description="UUID of the company"), session: AsyncSession = Depends(deps.get_session),
                        current_user: User = Depends(deps.get_current_user)):
