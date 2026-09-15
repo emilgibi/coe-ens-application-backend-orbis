@@ -658,7 +658,10 @@ async def get_latest_session_for_ens_id(
 
         # Apply filters
         if ens_id:
-            query = query.where(table_class.c.ens_id == str(ens_id) and table_class.c.overall_status == "COMPLETED").distinct()
+            # NOTE: must use and_() here, not the Python `and` keyword — `A and B`
+            # on two SQLAlchemy expressions does not combine them into a SQL AND,
+            # it just evaluates truthiness and silently drops one side.
+            query = query.where(and_(table_class.c.ens_id == str(ens_id), table_class.c.overall_status == "COMPLETED")).distinct()
         if session_id:
             query = query.where(table_class.c.session_id == str(session_id))
 
@@ -670,7 +673,7 @@ async def get_latest_session_for_ens_id(
         exists_query = select(func.count()).select_from(table_class)
 
         if ens_id:
-            exists_query = exists_query.where(table_class.c.ens_id == str(ens_id) and table_class.c.overall_status == "COMPLETED")
+            exists_query = exists_query.where(and_(table_class.c.ens_id == str(ens_id), table_class.c.overall_status == "COMPLETED"))
         if session_id:
             exists_query = exists_query.where(table_class.c.session_id == str(session_id))
 
